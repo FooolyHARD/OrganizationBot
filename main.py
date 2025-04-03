@@ -25,9 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Состояния диалога
 REGISTER_NAME, REGISTER_ROLE, JUDGE_DISCIPLINE = range(3)
-
 
 async def init_db():
     """Инициализация подключения к PostgreSQL"""
@@ -151,7 +149,6 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
         message = update.callback_query.message if update.callback_query else update.message
         await message.reply_text("🎉 Регистрация завершена!")
 
-        # Показываем главное меню после регистрации
         await show_main_menu(update, context)
         return ConversationHandler.END
 
@@ -177,13 +174,10 @@ async def call_expert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with pool.acquire() as conn:
-            # Проверяем, что это судья
             judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1 AND role = 'judge'", judge_id)
             if not judge:
                 await query.edit_message_text("❌ Только судьи могут вызывать экспертов!")
                 return
-
-            # Создаем новый вызов (теперь можно несколько активных)
             call_id = await conn.fetchval(
                 """INSERT INTO calls (judge_id, discipline, created_at) 
                 VALUES ($1, $2, $3) RETURNING id""",
@@ -191,8 +185,6 @@ async def call_expert(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 judge['discipline'],
                 datetime.now()
             )
-
-            # Отправляем уведомления экспертам
             experts = await conn.fetch("SELECT user_id FROM users WHERE role = 'expert'")
             for expert in experts:
                 try:
@@ -227,31 +219,26 @@ async def respond_to_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with pool.acquire() as conn:
-            # Проверяем, что это эксперт
             expert = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1 AND role = 'expert'", expert_id)
             if not expert:
                 await query.edit_message_text("❌ Только эксперты могут откликаться!")
                 return
 
-            # Получаем информацию о вызове
             call = await conn.fetchrow("SELECT * FROM calls WHERE id = $1", call_id)
             if not call:
                 await query.edit_message_text("❌ Этот вызов не существует!")
                 return
 
-            # Проверяем, не занят ли уже вызов
             if call['expert_id'] is not None:
                 await query.edit_message_text("❌ Этот вызов уже занят другим экспертом!")
                 return
 
-            # Назначаем эксперта на вызов
             await conn.execute(
                 "UPDATE calls SET expert_id = $1 WHERE id = $2",
                 expert_id,
                 call_id
             )
 
-            # Уведомляем судью
             judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", call['judge_id'])
             await context.bot.send_message(
                 judge['user_id'],
@@ -280,7 +267,6 @@ async def cancel_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with pool.acquire() as conn:
-            # Удаляем активные вызовы этого судьи без эксперта
             result = await conn.execute(
                 "DELETE FROM calls WHERE judge_id = $1 AND expert_id IS NULL",
                 judge_id
@@ -290,8 +276,6 @@ async def cancel_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("Нет активных вызовов для отмены.")
             else:
                 await query.edit_message_text("✅ Все активные вызовы отменены.")
-
-        # Обновляем меню
         await show_main_menu(update, context)
 
     except Exception as e:
@@ -303,8 +287,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает главное меню с постоянной кнопкой вызова"""
     pool = context.bot_data['db_pool']
     user_id = update.effective_user.id
-
-    # Получаем объект сообщения для ответа
     message = update.message or update.callback_query.message
 
     try:
@@ -316,14 +298,11 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if user['role'] == "judge":
-            # Клавиатура с постоянной кнопкой вызова
             keyboard = [
                 [InlineKeyboardButton("📢 Вызвать эксперта", callback_data="call_expert")],
                 [InlineKeyboardButton("🔄 Обновить статус", callback_data="refresh_status")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-
-            # Проверяем активные вызовы
             async with pool.acquire() as conn:
                 active_call = await conn.fetchrow(
                     "SELECT * FROM calls WHERE judge_id = $1 AND expert_id IS NULL",
@@ -332,8 +311,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             status_text = "❌ Нет активных вызовов" if not active_call else \
                 f"🟡 Ожидаем эксперта (ID: {active_call['id']})"
-
-            # Отправляем или обновляем сообщение
             if update.callback_query:
                 await update.callback_query.edit_message_text(
                     f"Главное меню судьи ({user.get('discipline', '')})\n"
@@ -366,11 +343,9 @@ async def main():
     application = None
 
     try:
-        # Инициализация БД
         pool = await init_db()
         await init_db_schema(pool)
 
-        # Создание таблиц (если не существуют)
         async with pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -381,11 +356,9 @@ async def main():
                 )
             """)
 
-        # Создание бота
         application = Application.builder().token(os.getenv('BOT_TOKEN')).build()
         application.bot_data['db_pool'] = pool
 
-        # Настройка обработчиков
         conv_handler = ConversationHandler(
             entry_points=[CommandHandler("start", start)],
             states={
@@ -400,7 +373,6 @@ async def main():
 
         application.add_handler(conv_handler)
 
-        # Запуск бота с обработкой сигналов
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
@@ -409,7 +381,6 @@ async def main():
         application.add_handler(CallbackQueryHandler(respond_to_call, pattern=r"^respond_\d+$"))
         application.add_handler(CallbackQueryHandler(refresh_status, pattern="^refresh_status$"))
 
-        # Ожидание сигнала завершения
         loop = asyncio.get_running_loop()
         stop_event = asyncio.Event()
 
@@ -421,7 +392,6 @@ async def main():
     except Exception as e:
         logger.error(f"Фатальная ошибка: {str(e)}")
     finally:
-        # Корректное завершение работы
         if application:
             if application.updater and application.updater.running:
                 await application.updater.stop()
