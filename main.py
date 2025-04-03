@@ -83,7 +83,8 @@ async def register_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "Выберите вашу роль:",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Эксперт", callback_data="expert")],
-            [InlineKeyboardButton("Судья", callback_data="judge")]
+            [InlineKeyboardButton("Судья", callback_data="judge")],
+            [InlineKeyboardButton("Главный судья", callback_data="head_judge")]
         ])
     )
     return REGISTER_ROLE
@@ -122,9 +123,83 @@ async def register_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             ])
         )
         return JUDGE_DISCIPLINE
+    elif role == "head_judge":
+        return await complete_registration(update, context)
     else:
         return await complete_registration(update, context)
 
+
+async def call_head_judge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик вызова главного судьи"""
+    query = update.callback_query
+    await query.answer()
+
+    pool = context.bot_data['db_pool']
+    user_id = query.from_user.id
+
+    try:
+        async with pool.acquire() as conn:
+            judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+            if not judge:
+                await query.edit_message_text("❌ Только судьи могут вызывать главного судью!")
+                return
+
+            head_judges = await conn.fetch("SELECT user_id FROM users WHERE role = 'head_judge'")
+
+            if not head_judges:
+                await query.edit_message_text("❌ Нет доступных главных судей!")
+                return
+
+            for head_judge in head_judges:
+                try:
+                    await context.bot.send_message(
+                        head_judge['user_id'],
+                        f"🔔 Судья {judge['name']} ({judge.get('discipline', '')}) вызывает главного судью!\n"
+                        f"📍 Место: {judge.get('discipline', 'не указано')}\n"
+                        f"👤 ID судьи: {user_id}",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("Принять вызов", callback_data=f"respond_head_{user_id}")]
+                        ])
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка отправки главному судье {head_judge['user_id']}: {e}")
+
+        await query.edit_message_text("✅ Запрос отправлен главному судье!")
+
+    except Exception as e:
+        logger.error(f"Ошибка при вызове главного судьи: {e}")
+        await query.edit_message_text("⚠️ Ошибка при вызове главного судьи. Попробуйте позже.")
+
+
+async def respond_head_judge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик отклика главного судьи"""
+    query = update.callback_query
+    await query.answer()
+
+    pool = context.bot_data['db_pool']
+    head_judge_id = query.from_user.id
+    judge_id = int(query.data.split('_')[2])  # Формат: respond_head_123456789
+
+    try:
+        async with pool.acquire() as conn:
+            judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", judge_id)
+            head_judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", head_judge_id)
+
+            if not judge or not head_judge:
+                await query.edit_message_text("❌ Ошибка: пользователь не найден!")
+                return
+
+            await context.bot.send_message(
+                judge_id,
+                f"✅ Главный судья {head_judge['name']} ответил на ваш вызов!\n"
+                f"Он уже направляется к вам."
+            )
+
+        await query.edit_message_text(f"✅ Вы приняли вызов от судьи {judge['name']}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при отклике главного судьи: {e}")
+        await query.edit_message_text("⚠️ Ошибка при обработке вызова. Попробуйте позже.")
 
 async def judge_discipline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработка выбора дисциплины"""
@@ -317,6 +392,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user['role'] == "judge":
             keyboard = [
                 [InlineKeyboardButton("📢 Вызвать эксперта", callback_data="call_expert")],
+                [InlineKeyboardButton("🆘 Вызвать главного судью", callback_data="call_head_judge")],
                 [InlineKeyboardButton("🔄 Обновить статус", callback_data="refresh_status")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -340,6 +416,13 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Текущий статус: {status_text}",
                     reply_markup=reply_markup
                 )
+        elif user['role'] == "head_judge":
+            await message.reply_text(
+                "👨‍⚖️ Вы главный судья. Ожидайте вызовов от других судей.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Обновить статус", callback_data="refresh_status")]
+                ])
+            )
         else:
             await message.reply_text("🛎 Вы эксперт. Ожидайте вызовов.")
 
@@ -399,6 +482,8 @@ async def main():
         application.add_handler(CallbackQueryHandler(respond_to_call, pattern=r"^respond_\d+$"))
         application.add_handler(CallbackQueryHandler(respond_to_call, pattern=r"^respond_\d+$"))
         application.add_handler(CallbackQueryHandler(refresh_status, pattern="^refresh_status$"))
+        application.add_handler(CallbackQueryHandler(call_head_judge, pattern="^call_head_judge$"))
+        application.add_handler(CallbackQueryHandler(respond_head_judge, pattern=r"^respond_head_\d+$"))
 
         loop = asyncio.get_running_loop()
         stop_event = asyncio.Event()
