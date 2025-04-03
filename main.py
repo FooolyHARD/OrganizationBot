@@ -6,7 +6,7 @@ from signal import SIGINT, SIGTERM
 
 import asyncpg
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, User
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,8 +40,16 @@ async def init_db():
 
 
 async def init_db_schema(pool):
-    """Инициализация схемы базы данных без уникального ограничения"""
+    """Инициализация схемы базы данных"""
     async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                name TEXT NOT NULL,
+                role TEXT NOT NULL,
+                discipline TEXT
+            )
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS calls (
                 id SERIAL PRIMARY KEY,
@@ -49,8 +57,15 @@ async def init_db_schema(pool):
                 expert_id BIGINT REFERENCES users(user_id),
                 discipline TEXT NOT NULL,
                 created_at TIMESTAMP NOT NULL
-                /* Убрано UNIQUE (judge_id, expert_id) */
             )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS hj_calls (
+                id SERIAL PRIMARY KEY,
+                judge_id BIGINT REFERENCES users(user_id) NOT NULL,
+                head_judge_id BIGINT REFERENCES users(user_id),
+                created_at TIMESTAMP NOT NULL,
+                resolved_at TIMESTAMP)
         """)
 
 
@@ -119,87 +134,12 @@ async def register_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 [InlineKeyboardButton("Сумо андроидных роботов", callback_data="android")],
                 [InlineKeyboardButton("Мини сумо", callback_data="minisumo")],
                 [InlineKeyboardButton("Микро сумо", callback_data="microsumo")],
-
             ])
         )
         return JUDGE_DISCIPLINE
-    elif role == "head_judge":
-        return await complete_registration(update, context)
     else:
         return await complete_registration(update, context)
 
-
-async def call_head_judge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик вызова главного судьи"""
-    query = update.callback_query
-    await query.answer()
-
-    pool = context.bot_data['db_pool']
-    user_id = query.from_user.id
-
-    try:
-        async with pool.acquire() as conn:
-            judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
-            if not judge:
-                await query.edit_message_text("❌ Только судьи могут вызывать главного судью!")
-                return
-
-            head_judges = await conn.fetch("SELECT user_id FROM users WHERE role = 'head_judge'")
-
-            if not head_judges:
-                await query.edit_message_text("❌ Нет доступных главных судей!")
-                return
-
-            for head_judge in head_judges:
-                try:
-                    await context.bot.send_message(
-                        head_judge['user_id'],
-                        f"🔔 Судья {judge['name']} ({judge.get('discipline', '')}) вызывает главного судью!\n"
-                        f"📍 Место: {judge.get('discipline', 'не указано')}\n"
-                        f"👤 ID судьи: {user_id}",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("Принять вызов", callback_data=f"respond_head_{user_id}")]
-                        ])
-                    )
-                except Exception as e:
-                    logger.error(f"Ошибка отправки главному судье {head_judge['user_id']}: {e}")
-
-        await query.edit_message_text("✅ Запрос отправлен главному судье!")
-
-    except Exception as e:
-        logger.error(f"Ошибка при вызове главного судьи: {e}")
-        await query.edit_message_text("⚠️ Ошибка при вызове главного судьи. Попробуйте позже.")
-
-
-async def respond_head_judge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик отклика главного судьи"""
-    query = update.callback_query
-    await query.answer()
-
-    pool = context.bot_data['db_pool']
-    head_judge_id = query.from_user.id
-    judge_id = int(query.data.split('_')[2])  # Формат: respond_head_123456789
-
-    try:
-        async with pool.acquire() as conn:
-            judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", judge_id)
-            head_judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", head_judge_id)
-
-            if not judge or not head_judge:
-                await query.edit_message_text("❌ Ошибка: пользователь не найден!")
-                return
-
-            await context.bot.send_message(
-                judge_id,
-                f"✅ Главный судья {head_judge['name']} ответил на ваш вызов!\n"
-                f"Он уже направляется к вам."
-            )
-
-        await query.edit_message_text(f"✅ Вы приняли вызов от судьи {judge['name']}")
-
-    except Exception as e:
-        logger.error(f"Ошибка при отклике главного судьи: {e}")
-        await query.edit_message_text("⚠️ Ошибка при обработке вызова. Попробуйте позже.")
 
 async def judge_discipline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработка выбора дисциплины"""
@@ -215,6 +155,8 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         pool = context.bot_data['db_pool']
         user_data = context.user_data
+
+        message = update.message or update.callback_query.message
 
         async with pool.acquire() as conn:
             if user_data['role'] == "judge":
@@ -235,18 +177,14 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
                     user_data['role']
                 )
 
-        await (update.callback_query.message if update.callback_query else update.message).reply_text(
-            "🎉 Регистрация завершена!"
-        )
-        message = update.callback_query.message if update.callback_query else update.message
         await message.reply_text("🎉 Регистрация завершена!")
-
         await show_main_menu(update, context)
         return ConversationHandler.END
 
     except Exception as e:
         logger.error(f"Ошибка при завершении регистрации: {str(e)}")
-        await update.message.reply_text("⚠️ Ошибка при сохранении данных. Попробуйте позже.")
+        message = update.callback_query.message if update.callback_query else update.message
+        await message.reply_text("⚠️ Ошибка при сохранении данных. Попробуйте позже.")
         return ConversationHandler.END
 
 
@@ -257,7 +195,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def call_expert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик вызова эксперта с возможностью нескольких вызовов"""
+    """Обработчик вызова эксперта"""
     query = update.callback_query
     await query.answer()
 
@@ -270,6 +208,7 @@ async def call_expert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not judge:
                 await query.edit_message_text("❌ Только судьи могут вызывать экспертов!")
                 return
+
             call_id = await conn.fetchval(
                 """INSERT INTO calls (judge_id, discipline, created_at) 
                 VALUES ($1, $2, $3) RETURNING id""",
@@ -277,6 +216,7 @@ async def call_expert(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 judge['discipline'],
                 datetime.now()
             )
+
             experts = await conn.fetch("SELECT user_id FROM users WHERE role = 'expert'")
             for expert in experts:
                 try:
@@ -286,7 +226,7 @@ async def call_expert(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"📍 Дисциплина: {judge['discipline']}\n"
                         f"🆔 ID вызова: {call_id}",
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("Откликнуться", callback_data=f"respond_{call_id}")]
+                            [InlineKeyboardButton("Откликнуться", callback_data=f"respond_expert_{call_id}")]
                         ])
                     )
                 except Exception as e:
@@ -300,57 +240,8 @@ async def call_expert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Ошибка при вызове эксперта. Попробуйте позже.")
 
 
-async def respond_to_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик отклика эксперта без проверки уникальности"""
-    query = update.callback_query
-    await query.answer()
-
-    pool = context.bot_data['db_pool']
-    expert_id = query.from_user.id
-    call_id = int(query.data.split('_')[1])
-
-    try:
-        async with pool.acquire() as conn:
-            expert = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1 AND role = 'expert'", expert_id)
-            if not expert:
-                await query.edit_message_text("❌ Только эксперты могут откликаться!")
-                return
-
-            call = await conn.fetchrow("SELECT * FROM calls WHERE id = $1", call_id)
-            if not call:
-                await query.edit_message_text("❌ Этот вызов не существует!")
-                return
-
-            if call['expert_id'] is not None:
-                await query.edit_message_text("❌ Этот вызов уже занят другим экспертом!")
-                return
-
-            await conn.execute(
-                "UPDATE calls SET expert_id = $1 WHERE id = $2",
-                expert_id,
-                call_id
-            )
-
-            judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", call['judge_id'])
-            await context.bot.send_message(
-                judge['user_id'],
-                f"✅ Эксперт {expert['name']} ответил на ваш вызов!\n"
-                f"Он уже направляется к вам."
-            )
-
-        await query.edit_message_text("✅ Вы успешно откликнулись на вызов!")
-
-    except Exception as e:
-        logger.error(f"Ошибка при отклике на вызов: {e}")
-        await query.edit_message_text("⚠️ Ошибка при обработке вашего отклика.")
-
-    except Exception as e:
-        logger.error(f"Ошибка при отклике на вызов: {e}")
-        await query.edit_message_text("⚠️ Ошибка при обработке вашего отклика.")
-
-
-async def cancel_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик отмены вызова эксперта"""
+async def call_head_judge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик вызова главного судьи с изменением сообщения"""
     query = update.callback_query
     await query.answer()
 
@@ -359,15 +250,195 @@ async def cancel_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with pool.acquire() as conn:
-            result = await conn.execute(
+            judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1 AND role = 'judge'", judge_id)
+            if not judge:
+                await query.edit_message_text("❌ Только судьи могут вызывать главного судью!")
+                return
+
+            call_id = await conn.fetchval(
+                """INSERT INTO hj_calls (judge_id, created_at) 
+                VALUES ($1, $2) RETURNING id""",
+                judge_id,
+                datetime.now()
+            )
+
+            head_judges = await conn.fetch("SELECT user_id FROM users WHERE role = 'head_judge'")
+            for hj in head_judges:
+                try:
+                    await context.bot.send_message(
+                        hj['user_id'],
+                        f"🔔 Судья {judge['name']} вызывает главного судью!\n"
+                        f"📍 Дисциплина: {judge.get('discipline', 'не указана')}\n"
+                        f"🆔 ID вызова: {call_id}",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("Принять вызов", callback_data=f"respond_hj_{call_id}")]
+                        ])
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка отправки главному судье {hj['user_id']}: {e}")
+
+        # Изменяем сообщение на "Запрос отправлен, ожидайте ответа"
+        await query.edit_message_text(
+            "✅ Запрос отправлен главным судьям. Ожидайте ответа...",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Обновить статус", callback_data="refresh_status")]
+            ])
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка при вызове главного судьи: {e}")
+        await query.edit_message_text("⚠️ Ошибка при вызове главного судьи. Попробуйте позже.")
+
+
+async def respond_to_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Унифицированный обработчик отклика на вызов"""
+    query = update.callback_query
+    await query.answer()
+
+    pool = context.bot_data['db_pool']
+    responder_id = query.from_user.id
+    call_type, call_id = query.data.split('_')[1], int(query.data.split('_')[2])
+
+    try:
+        async with pool.acquire() as conn:
+            if call_type == "expert":
+                # Обработка эксперта (оставляем как было)
+                responder = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1 AND role = 'expert'", responder_id)
+                if not responder:
+                    await query.edit_message_text("❌ Только эксперты могут откликаться на этот вызов!")
+                    return
+
+                call = await conn.fetchrow("SELECT * FROM calls WHERE id = $1", call_id)
+                if not call:
+                    await query.edit_message_text("❌ Этот вызов не существует!")
+                    return
+
+                if call['expert_id'] is not None:
+                    await query.edit_message_text("❌ Этот вызов уже занят другим экспертом!")
+                    return
+
+                await conn.execute(
+                    "UPDATE calls SET expert_id = $1 WHERE id = $2",
+                    responder_id,
+                    call_id
+                )
+
+                judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", call['judge_id'])
+                await context.bot.send_message(
+                    judge['user_id'],
+                    f"✅ Эксперт {responder['name']} ответил на ваш вызов!\n"
+                    f"Он уже направляется к вам."
+                )
+
+                await query.edit_message_text("✅ Вы успешно откликнулись на вызов!")
+
+            elif call_type == "hj":
+                # Обработка главного судьи
+                responder = await conn.fetchrow(
+                    "SELECT * FROM users WHERE user_id = $1 AND role = 'head_judge'",
+                    responder_id
+                )
+                if not responder:
+                    await query.edit_message_text("❌ Только главные судьи могут принимать вызовы!")
+                    return
+
+                call = await conn.fetchrow(
+                    """SELECT * FROM hj_calls 
+                    WHERE id = $1 AND head_judge_id IS NULL
+                    FOR UPDATE""",
+                    call_id
+                )
+                if not call:
+                    await query.edit_message_text("❌ Этот вызов уже обработан!")
+                    return
+
+                await conn.execute(
+                    """UPDATE hj_calls 
+                    SET head_judge_id = $1, resolved_at = $2
+                    WHERE id = $3""",
+                    responder_id,
+                    datetime.now(),
+                    call_id
+                )
+
+                judge = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", call['judge_id'])
+                await context.bot.send_message(
+                    judge['user_id'],
+                    f"✅ Главный судья {responder['name']} принял ваш вызов!\n"
+                    f"Он уже направляется к вам."
+                )
+
+                # Обновляем сообщение у главного судьи (оставляем его меню)
+                await query.edit_message_text(
+                    f"✅ Вы приняли вызов от судьи {judge['name']}\n"
+                    f"Дисциплина: {judge.get('discipline', 'не указана')}"
+                )
+
+        # Обновляем меню для всех участников
+        if call and 'judge_id' in call:
+            # Обновляем меню судьи
+            await show_main_menu(
+                Update(
+                    update.update_id,
+                    callback_query=CallbackQuery(
+                        id=str(update.update_id),
+                        from_user=User(id=call['judge_id'], first_name=judge['name'], is_bot=False),
+                        message=query.message,
+                        chat_instance=query.chat_instance
+                    )
+                ),
+                context
+            )
+
+        if call_type == "hj":
+            # Обновляем меню главного судьи
+            await show_main_menu(
+                Update(
+                    update.update_id,
+                    callback_query=CallbackQuery(
+                        id=str(update.update_id),
+                        from_user=User(id=responder_id, first_name=responder['name'], is_bot=False),
+                        message=query.message,
+                        chat_instance=query.chat_instance
+                    )
+                ),
+                context
+            )
+
+    except Exception as e:
+        logger.error(f"Ошибка при отклике на вызов: {e}")
+        await query.edit_message_text("⚠️ Ошибка при обработке вашего отклика.")
+
+
+
+async def cancel_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик отмены вызовов (экспертов и главных судей)"""
+    query = update.callback_query
+    await query.answer()
+
+    pool = context.bot_data['db_pool']
+    judge_id = query.from_user.id
+
+    try:
+        async with pool.acquire() as conn:
+            # Отменяем вызовы экспертов
+            expert_calls = await conn.execute(
                 "DELETE FROM calls WHERE judge_id = $1 AND expert_id IS NULL",
                 judge_id
             )
 
-            if result[-1] == '0':
+            # Отменяем вызовы главного судьи
+            hj_calls = await conn.execute(
+                "DELETE FROM hj_calls WHERE judge_id = $1 AND head_judge_id IS NULL",
+                judge_id
+            )
+
+            total_cancelled = int(expert_calls[-1]) + int(hj_calls[-1])
+            if total_cancelled == 0:
                 await query.edit_message_text("Нет активных вызовов для отмены.")
             else:
-                await query.edit_message_text("✅ Все активные вызовы отменены.")
+                await query.edit_message_text(f"✅ Отменено {total_cancelled} активных вызовов.")
+
         await show_main_menu(update, context)
 
     except Exception as e:
@@ -376,59 +447,86 @@ async def cancel_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает главное меню с постоянной кнопкой вызова"""
+    """Показывает главное меню с информацией о статусе"""
     pool = context.bot_data['db_pool']
     user_id = update.effective_user.id
-    message = update.message or update.callback_query.message
 
     try:
+        message = update.message or update.callback_query.message
+
         async with pool.acquire() as conn:
             user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
 
-        if not user:
-            await message.reply_text("Пожалуйста, сначала зарегистрируйтесь через /start")
-            return
+            if not user:
+                await message.reply_text("Пожалуйста, сначала зарегистрируйтесь через /start")
+                return
 
-        if user['role'] == "judge":
-            keyboard = [
-                [InlineKeyboardButton("📢 Вызвать эксперта", callback_data="call_expert")],
-                [InlineKeyboardButton("🆘 Вызвать главного судью", callback_data="call_head_judge")],
-                [InlineKeyboardButton("🔄 Обновить статус", callback_data="refresh_status")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            async with pool.acquire() as conn:
-                active_call = await conn.fetchrow(
-                    "SELECT * FROM calls WHERE judge_id = $1 AND expert_id IS NULL",
+            if user['role'] == "judge":
+                active_expert_calls = await conn.fetchval(
+                    "SELECT COUNT(*) FROM calls WHERE judge_id = $1 AND expert_id IS NULL",
                     user_id
                 )
 
-            status_text = "❌ Нет активных вызовов" if not active_call else \
-                f"🟡 Ожидаем эксперта (ID: {active_call['id']})"
-            if update.callback_query:
-                await update.callback_query.edit_message_text(
-                    f"Главное меню судьи ({user.get('discipline', '')})\n"
-                    f"Текущий статус: {status_text}",
-                    reply_markup=reply_markup
+                active_hj_calls = await conn.fetchval(
+                    "SELECT COUNT(*) FROM hj_calls WHERE judge_id = $1 AND head_judge_id IS NULL",
+                    user_id
                 )
-            else:
-                await message.reply_text(
-                    f"Главное меню судьи ({user.get('discipline', '')})\n"
-                    f"Текущий статус: {status_text}",
-                    reply_markup=reply_markup
+
+                text = (
+                    f"👨‍⚖️ Главное меню судьи ({user.get('discipline', 'без дисциплины')})\n"
+                    f"Активных вызовов экспертов: {active_expert_calls}\n"
+                    f"Активных вызовов главного судьи: {active_hj_calls}"
                 )
-        elif user['role'] == "head_judge":
-            await message.reply_text(
-                "👨‍⚖️ Вы главный судья. Ожидайте вызовов от других судей.",
-                reply_markup=InlineKeyboardMarkup([
+
+                keyboard = [
+                    [InlineKeyboardButton("📢 Вызвать эксперта", callback_data="call_expert")],
+                    [InlineKeyboardButton("🆘 Вызвать главного судью", callback_data="call_head_judge")],
+                    [InlineKeyboardButton("❌ Отменить все вызовы", callback_data="cancel_calls")],
                     [InlineKeyboardButton("🔄 Обновить статус", callback_data="refresh_status")]
-                ])
-            )
+                ]
+
+            elif user['role'] == "head_judge":
+                active_calls = await conn.fetchval(
+                    "SELECT COUNT(*) FROM hj_calls WHERE head_judge_id IS NULL"
+                )
+
+                text = (
+                    "👨‍⚖️ Вы главный судья\n"
+                    f"Ожидает обработки вызовов: {active_calls}"
+                )
+
+                keyboard = [
+                    [InlineKeyboardButton("🔄 Обновить статус", callback_data="refresh_status")]
+                ]
+
+            else:  # expert
+                text = "🛎 Вы эксперт. Ожидайте вызовов."
+                keyboard = [
+                    [InlineKeyboardButton("🔄 Обновить статус", callback_data="refresh_status")]
+                ]
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if update.callback_query:
+            try:
+                await update.callback_query.edit_message_text(
+                    text,
+                    reply_markup=reply_markup
+                )
+            except Exception as edit_error:
+                if "Message is not modified" not in str(edit_error):
+                    raise edit_error
         else:
-            await message.reply_text("🛎 Вы эксперт. Ожидайте вызовов.")
+            await message.reply_text(
+                text,
+                reply_markup=reply_markup
+            )
 
     except Exception as e:
         logger.error(f"Ошибка в show_main_menu: {e}")
-        await message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+        message = update.message or (update.callback_query.message if update.callback_query else None)
+        if message:
+            await message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
 
 
 async def refresh_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -447,16 +545,6 @@ async def main():
         pool = await init_db()
         await init_db_schema(pool)
 
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-              user_id BIGINT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    discipline TEXT
-                )
-            """)
-
         application = Application.builder().token(os.getenv('BOT_TOKEN')).build()
         application.bot_data['db_pool'] = pool
 
@@ -464,9 +552,9 @@ async def main():
             entry_points=[CommandHandler("start", start)],
             states={
                 REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
-                REGISTER_ROLE: [CallbackQueryHandler(register_role, pattern="^(expert|judge)$")],
+                REGISTER_ROLE: [CallbackQueryHandler(register_role, pattern="^(expert|judge|head_judge)$")],
                 JUDGE_DISCIPLINE: [CallbackQueryHandler(judge_discipline,
-                                                        pattern="^(relay|practicallego|linecons|BEAMline|narrowline|maze|robocup|airrace|sumo|aqua|onstage|walking|footballauto|rally|android|minisumo|microsumo)$")]
+                                                      pattern="^(relay|practicallego|linecons|BEAMline|narrowline|maze|robocup|airrace|sumo|aqua|onstage|walking|footballauto|rally|android|minisumo|microsumo)$")]
             },
             fallbacks=[CommandHandler("cancel", cancel)],
             per_chat=True,
@@ -474,16 +562,15 @@ async def main():
         )
 
         application.add_handler(conv_handler)
+        application.add_handler(CallbackQueryHandler(call_expert, pattern="^call_expert$"))
+        application.add_handler(CallbackQueryHandler(call_head_judge, pattern="^call_head_judge$"))
+        application.add_handler(CallbackQueryHandler(respond_to_call, pattern=r"^respond_(expert|hj)_\d+$"))
+        application.add_handler(CallbackQueryHandler(cancel_call, pattern="^cancel_calls$"))
+        application.add_handler(CallbackQueryHandler(refresh_status, pattern="^refresh_status$"))
 
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
-        application.add_handler(CallbackQueryHandler(call_expert, pattern="^call_expert$"))
-        application.add_handler(CallbackQueryHandler(respond_to_call, pattern=r"^respond_\d+$"))
-        application.add_handler(CallbackQueryHandler(respond_to_call, pattern=r"^respond_\d+$"))
-        application.add_handler(CallbackQueryHandler(refresh_status, pattern="^refresh_status$"))
-        application.add_handler(CallbackQueryHandler(call_head_judge, pattern="^call_head_judge$"))
-        application.add_handler(CallbackQueryHandler(respond_head_judge, pattern=r"^respond_head_\d+$"))
 
         loop = asyncio.get_running_loop()
         stop_event = asyncio.Event()
@@ -494,6 +581,7 @@ async def main():
         await stop_event.wait()
 
     except Exception as e:
+        print(e)
         logger.error(f"Фатальная ошибка: {str(e)}")
     finally:
         if application:
