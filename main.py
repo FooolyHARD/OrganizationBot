@@ -1,8 +1,10 @@
-import os
-import logging
 import asyncio
+import logging
+import os
 from datetime import datetime
+from signal import SIGINT, SIGTERM
 
+import asyncpg
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -14,8 +16,6 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler
 )
-import asyncpg
-from signal import SIGINT, SIGTERM
 
 load_dotenv()
 
@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 REGISTER_NAME, REGISTER_ROLE, JUDGE_DISCIPLINE = range(3)
 
+
 async def init_db():
     """Инициализация подключения к PostgreSQL"""
     return await asyncpg.create_pool(
@@ -36,6 +37,7 @@ async def init_db():
         host=os.getenv('DB_HOST'),
         port=int(os.getenv('DB_PORT'))
     )
+
 
 async def init_db_schema(pool):
     """Инициализация схемы базы данных без уникального ограничения"""
@@ -99,9 +101,24 @@ async def register_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await query.edit_message_text(
             "Выберите вашу дисциплину:",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Робототехника", callback_data="robotics")],
-                [InlineKeyboardButton("Программирование", callback_data="programming")],
-                [InlineKeyboardButton("3D-моделирование", callback_data="modeling")]
+                [InlineKeyboardButton("Эстафета", callback_data="relay")],
+                [InlineKeyboardButton("Практическая олимпиада LEGO", callback_data="practicallego")],
+                [InlineKeyboardButton("Следование по линии обр. конструкторы", callback_data="linecons")],
+                [InlineKeyboardButton("Следование по линии: BEAM", callback_data="BEAMline")],
+                [InlineKeyboardButton("Следование по узкой линии", callback_data="narrowline")],
+                [InlineKeyboardButton("Лабиринт", callback_data="maze")],
+                [InlineKeyboardButton("RoboCup", callback_data="robocup")],
+                [InlineKeyboardButton("Воздушные гонки", callback_data="airrace")],
+                [InlineKeyboardButton("Сумо", callback_data="sumo")],
+                [InlineKeyboardButton("Аквароботы", callback_data="aqua")],
+                [InlineKeyboardButton("OnStage", callback_data="onstage")],
+                [InlineKeyboardButton("Марафон шагающих роботов", callback_data="walking")],
+                [InlineKeyboardButton("Футбол автономный", callback_data="footballauto")],
+                [InlineKeyboardButton("Ралли по коридору", callback_data="rally")],
+                [InlineKeyboardButton("Сумо андроидных роботов", callback_data="android")],
+                [InlineKeyboardButton("Мини сумо", callback_data="minisumo")],
+                [InlineKeyboardButton("Микро сумо", callback_data="microsumo")],
+
             ])
         )
         return JUDGE_DISCIPLINE
@@ -330,6 +347,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка в show_main_menu: {e}")
         await message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
 
+
 async def refresh_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обновляет статус вызовов"""
     query = update.callback_query
@@ -364,7 +382,8 @@ async def main():
             states={
                 REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
                 REGISTER_ROLE: [CallbackQueryHandler(register_role, pattern="^(expert|judge)$")],
-                JUDGE_DISCIPLINE: [CallbackQueryHandler(judge_discipline, pattern="^(robotics|programming|modeling)$")]
+                JUDGE_DISCIPLINE: [CallbackQueryHandler(judge_discipline,
+                                                        pattern="^(relay|practicallego|linecons|BEAMline|narrowline|maze|robocup|airrace|sumo|aqua|onstage|walking|footballauto|rally|android|minisumo|microsumo)$")]
             },
             fallbacks=[CommandHandler("cancel", cancel)],
             per_chat=True,
